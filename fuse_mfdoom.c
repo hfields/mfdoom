@@ -80,7 +80,7 @@ typedef struct {
 /*
  * Flag for toggling random file moves on write
  */
-int random_moves = 0;
+unsigned char random_moves = 0;
 
 /*
  * Space for holding a directory block in memory.
@@ -482,12 +482,31 @@ static size_t get_next_free_block()
  */
 static void free_block(block_t block) 
 {
-    // Set FAT entry of newly-freed block to point to old start of free list
+    /*
+     * Set FAT entry of newly-freed block to point to 
+     * old start of free list
+     * Update free list
+     */
     NEXT_BLOCK(block) = superblock.s.free_list;
     superblock.s.free_list = block;
 
     flush_fat();
     flush_superblock();
+}
+
+/*
+ * Given a start block, iterate through all connected
+ * blocks and free them.
+ */
+static void free_blocks(block_t block)
+{
+    block_t             next_block;
+
+    while (block != 0) {
+        next_block = NEXT_BLOCK(block);
+        free_block(block);
+        block = next_block;
+    }
 }
 
 static int fuse_mfdoom_mknod(const char *path, mode_t mode, dev_t rdev)
@@ -657,12 +676,7 @@ static int fuse_mfdoom_unlink(const char *path)
     /*
      * Free file space.
      */
-    block = start_block;
-    while (block != 0) {
-        next_block = NEXT_BLOCK(block);
-        free_block(block);
-        block = next_block;
-    }
+    free_blocks(start_block);
 
     /*
      * Write the directory back.
@@ -721,12 +735,7 @@ static int fuse_mfdoom_rmdir(const char *path)
     /*
      * Free directory space.
      */
-    block = start_block;
-    while (block != 0) {
-        next_block = NEXT_BLOCK(block);
-        free_block(block);
-        block = next_block;
-    }
+    free_blocks(start_block);
 
     return 0;
 }
@@ -940,49 +949,92 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
 
 static int fuse_mfdoom_rename(const char *from, const char *to)
 {
-    int                 nod_err;
-    int                 unlink_err;
-    int                 write_ret;
-    int                 read_size;
-    int                 write_size;
-    mfdoom_dirent*      dirent;
-    char                buf[BLOCK_SIZE];
+    block_t             block;
+    block_t             nextblock;
+    const char*         cp;
+    mfdoom_dirent*      from_dirent;
+    mfdoom_dirent*      to_dirent;
+    block_t             from_file_start;
+    size_t              from_size;
+    unsigned char       from_type;
+    size_t              len;
 
-    // Turn off random file moves
-    random_moves = 0;
+    /*
+     * If paths are the same, don't need to do anything
+     */
+    if (strcmp(from, to) == 0)
+        return 0;
 
-    dirent = find_dirent(from, 0);
-    if (dirent == NULL)
+    /*
+     * Find the file being renamed.
+     */
+    from_dirent = find_dirent(from, 0);
+    if (from_dirent == NULL)
         return -ENOENT;
-    if (dirent->type != TYPE_FILE)
-        return -EACCES;
 
-    // Create file with mknod
-    if (nod_err = fuse_mfdoom_mknod(to, S_IFREG, 0) != 0) {
-        return nod_err;
+    /*
+     * Store info from from_dirent before dirbuf is overwritten
+     */ 
+    from_file_start = from_dirent->file_start;
+    from_size = from_dirent->size;
+    from_type = from_dirent->type;
+
+    /*
+     * Check if new path already exists.
+     * If so, overwrite file and free space, then
+     * modify existing dirent
+     */
+    if ((to_dirent = find_dirent(to, 0)) != NULL) {
+        free_blocks(to_dirent->file_start);
+        goto doublebreak;
     }
 
-    read_size = BLOCK_SIZE;
+    /*
+     * Find the directory to make the new file in.
+     */
+    to_dirent = find_dirent(to, 1);
+    block = to_dirent->file_start;
 
-    // Write contents from original file to renamed file
-    for (off_t offset = 0; offset < dirent->size; offset += BLOCK_SIZE) {
-        // Read/write in full blocks until end of file
-        if (dirent->size - offset < BLOCK_SIZE) 
-            read_size = dirent->size - offset;
+    /*
+     * Find an empty slot.
+     */
+    while (block != 0) {
+        fetch_dirblock(block);
+        for (to_dirent = dirbuf;  to_dirent < dirend;  to_dirent++) {
+            if (to_dirent->type == TYPE_EMPTY)
+                goto doublebreak;
+        }
 
-        if (write_size = fuse_mfdoom_read(from, buf, read_size, offset, NULL) < 0)
-            return write_size;
-
-        if (write_ret = fuse_mfdoom_write(to, buf, write_size, offset, NULL) < 0)
-            return write_ret;
+        block = NEXT_BLOCK(block);
     }
+doublebreak:
+    if (block == 0)
+        return -EFBIG;                  /* No room in the directory */
+    to_dirent->file_start = from_file_start;
+    to_dirent->type = from_type;
+    to_dirent->size = from_size;
+    cp = strrchr(to, '/');
+    if (cp == NULL)
+        cp = to;
+    else
+        cp++;
+    len = strlen(cp);
+    if (len > NAME_LENGTH)
+        len = NAME_LENGTH;
+    to_dirent->namelen = len;
+    memcpy(to_dirent->name, cp, len);
 
-    // Delete the original file
-    if (unlink_err = fuse_mfdoom_unlink(from))
-        return unlink_err;
+    flush_dirblock();
 
-    // Re-enable random file moves
-    random_moves = 1;
+    /*
+     * Re-find the file being renamed.
+     * Zero it to delete the entry
+     */
+    from_dirent = find_dirent(from, 0);
+    if (from_dirent == NULL)
+        return -ENOENT;
+    memset(from_dirent, 0, sizeof *from_dirent);
+    flush_dirblock();
 
     return 0;
 }
