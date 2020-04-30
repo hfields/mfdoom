@@ -220,7 +220,7 @@ static void* fuse_mfdoom_init(struct fuse_conn_info *conn)
     superblock.s.magic = MFDOOM_MAGIC_LITTLE_ENDIAN;
     superblock.s.total_blocks = DISK_SIZE / BLOCK_SIZE;
     superblock.s.block_size = BLOCK_SIZE;
-    superblock.s.dir_count = 0;
+    superblock.s.dir_count = 1;
 
     /*
      * The FAT starts just past the superblock
@@ -925,35 +925,39 @@ static int find_random_dir(const char *path, char *buf)
     if (dirent->type != TYPE_DIR)
         return -ENOTDIR;
 
-    block = dirent->file_start;
-    while (block != 0) {
-        fetch_dirblock(block);
-        for (dirent = dirbuf;  dirent < dirend;  dirent++) {
-            if (dirent->type == TYPE_DIR 
-                    && strcmp(dirent->name, ".")
-                    && strcmp(dirent->name, "..")) {
-                /*
-                 * Generate a random float between 0.0 and 1.0
-                 * to determine if the current subdirectory should
-                 * be selected.
-                 */
-                prob = 1.0 / (superblock.s.dir_count - checked_dirs);
-                random = (float)rand()/(float)(RAND_MAX);
-                strcat(child_path, path);
-                strcat(child_path, dirent->name);
-                strcat(child_path, "/");
-                
-                /*
-                 * Select directory or recurse on subdirectory
-                 */ 
-                if (random <= prob) {
-                    memcpy(buf, child_path, strlen(child_path));
-                    checked_dirs = 0;
-                    return 1;
-                }
+    /*
+    * Generate a random float between 0.0 and 1.0
+    * to determine if the parent directory should
+    * be selected.
+    */
+    prob = 1.0 / (superblock.s.dir_count - checked_dirs);
+    random = (float)rand()/(float)(RAND_MAX);
 
-                else {
-                    checked_dirs++;
+    /*
+     * Parent directory selected
+     */ 
+    if (random <= prob) {
+        memcpy(buf, path, strlen(path));
+        checked_dirs = 0;
+        return 1;
+    }
+
+    /*
+     * Recurse on subdirectories
+     */ 
+    else {
+        checked_dirs++;
+        block = dirent->file_start;
+        while (block != 0) {
+            fetch_dirblock(block);
+            for (dirent = dirbuf;  dirent < dirend;  dirent++) {
+                if (dirent->type == TYPE_DIR 
+                        && strcmp(dirent->name, ".")
+                        && strcmp(dirent->name, "..")) {
+
+                    strcat(child_path, path);
+                    strcat(child_path, dirent->name);
+                    strcat(child_path, "/");
 
                     if (find_random_dir(child_path, buf)) {
                         checked_dirs = 0;
@@ -962,18 +966,17 @@ static int find_random_dir(const char *path, char *buf)
 
                     else {
                         /* 
-                         * Re-fetch dirblock to avoid side effects
-                         * of recursive calls
-                         */
+                        * Re-fetch dirblock to avoid side effects
+                        * of recursive calls and reset child path
+                        */
                         fetch_dirblock(block);
-
                         memset(child_path, 0, sizeof(child_path));
                     }
                 }
             }
-        }
 
-        block = NEXT_BLOCK(block);
+            block = NEXT_BLOCK(block);
+        }
     }
 
     return 0;
@@ -1130,7 +1133,7 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
      * randomly generate again. 
      */
     if (random_moves) {
-        find_random_dir("/", random_path)
+        find_random_dir("/", random_path);
         strcat(random_path, name);
         mfdoom_rename(path, random_path);
     }
