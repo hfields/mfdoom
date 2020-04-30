@@ -37,6 +37,7 @@ struct sblock {
     unsigned long       magic;          /* Magic number identifying filesys */
     size_t              total_blocks;   /* Total blocks (disk size) */
     size_t              block_size;     /* Size of each block */
+    size_t              dir_count;      /* Number of directories */
     block_t             fat_start;      /* First block of File Allocation Table */
     block_t             files_start;    /* First block of files */
     block_t             free_list;      /* First block of free list */
@@ -78,9 +79,11 @@ typedef struct {
                                         /* Max entries in a directory */
 
 /*
- * Flag for toggling random file moves on write
+ * Variables for random file moves
  */
-unsigned char random_moves = 0;
+unsigned char random_moves = 1;     /* Whether random file moves are allowed */
+size_t checked_dirs = 0;            /* Previously considered dirs in random selection */
+
 
 /*
  * Space for holding a directory block in memory.
@@ -217,6 +220,7 @@ static void* fuse_mfdoom_init(struct fuse_conn_info *conn)
     superblock.s.magic = MFDOOM_MAGIC_LITTLE_ENDIAN;
     superblock.s.total_blocks = DISK_SIZE / BLOCK_SIZE;
     superblock.s.block_size = BLOCK_SIZE;
+    superblock.s.dir_count = 0;
 
     /*
      * The FAT starts just past the superblock
@@ -629,7 +633,7 @@ doublebreak:
 
     /*
      * Initialize the new directory block.
-     * Update and save FAT
+     * Update and save FAT and superblock
      */
     dirblock = dirent->file_start;
     memset(dirbuf, 0, superblock.s.block_size);
@@ -645,9 +649,11 @@ doublebreak:
     memcpy(dirbuf[1].name, "..", 2);
 
     fat_table[dirblock - superblock.s.files_start] = 0;
+    superblock.s.dir_count++;
     
     flush_dirblock();
     flush_fat();
+    flush_superblock();
 
     return 0;
 }
@@ -728,13 +734,12 @@ static int fuse_mfdoom_rmdir(const char *path)
     memset(going_dirent, 0, sizeof *going_dirent);
 
     /*
-     * Write the parent back.
+     * Write the parent back, free directory
+     * space, and update superblock (flushed
+     * as a side effect of free_blocks)
      */
+    superblock.s.dir_count--;
     flush_dirblock();
-
-    /*
-     * Free directory space.
-     */
     free_blocks(start_block);
 
     return 0;
@@ -898,56 +903,83 @@ static int fuse_mfdoom_read(const char *path, char *buf, size_t size,
     return bytes_read;
 }
 
-static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
-  off_t offset, struct fuse_file_info *fi)
+/*
+ * Given a path to a directory, recursively finds a random
+ * subdirectory. If no subdirectory is randomly selected,
+ * returns 0.
+ */
+static int find_random_dir(const char *path, char *buf)
 {
     block_t             block;
-    char                blockbuf[BLOCK_SIZE];
-    size_t              bytes_written;
     mfdoom_dirent*      dirent;
-    off_t               orig_offset = offset;
-    size_t              write_size;
+    block_t             last_block;
+    float               prob;
+    float               random;
+    char                child_path[BLOCK_SIZE];
+
+    memset(child_path, 0, sizeof(child_path));
 
     dirent = find_dirent(path, 0);
     if (dirent == NULL)
         return -ENOENT;
-    if (dirent->type != TYPE_FILE)
-        return -EACCES;
+    if (dirent->type != TYPE_DIR)
+        return -ENOTDIR;
 
-    // Don't write beyond max file size
-    if (size > BLOCKS_PER_FILE * superblock.s.block_size - offset)
-        size = BLOCKS_PER_FILE * superblock.s.block_size - offset;
+    block = dirent->file_start;
+    while (block != 0) {
+        fetch_dirblock(block);
+        for (dirent = dirbuf;  dirent < dirend;  dirent++) {
+            if (dirent->type == TYPE_DIR 
+                    && strcmp(dirent->name, ".")
+                    && strcmp(dirent->name, "..")) {
+                /*
+                 * Generate a random float between 0.0 and 1.0
+                 * to determine if the current subdirectory should
+                 * be selected.
+                 */
+                prob = 1.0 / (superblock.s.dir_count - checked_dirs);
+                random = (float)rand()/(float)(RAND_MAX);
+                strcat(child_path, path);
+                strcat(child_path, dirent->name);
+                strcat(child_path, "/");
+                
+                /*
+                 * Select directory or recurse on subdirectory
+                 */ 
+                if (random <= prob) {
+                    memcpy(buf, child_path, strlen(child_path));
+                    checked_dirs = 0;
+                    return 1;
+                }
 
-    if (offset >= BLOCKS_PER_FILE * superblock.s.block_size)
-        return -EFBIG;                          /* File is too big */
-    else if (size == 0)
-        return -EIO;                            /* Empty writes are illegal */
+                else {
+                    checked_dirs++;
 
-    assert(superblock.s.block_size == BLOCK_SIZE);
+                    if (find_random_dir(child_path, buf)) {
+                        checked_dirs = 0;
+                        return 1;
+                    }
 
-    block = offset_to_block(dirent->file_start, offset);
-    offset = OFFSET_IN_BLOCK(offset);
+                    else {
+                        /* 
+                         * Re-fetch dirblock to avoid side effects
+                         * of recursive calls
+                         */
+                        fetch_dirblock(block);
 
-    for (bytes_written = 0;  size > 0;  block = NEXT_BLOCK(block), offset = 0) {
-        if (offset == 0  &&  size >= superblock.s.block_size)
-            read_block(block, blockbuf);        /* Only read if necessary */
-        write_size = size;
-        if (write_size > superblock.s.block_size - offset)
-            write_size = superblock.s.block_size - offset;
-        memcpy(blockbuf + offset, buf, write_size);
-        write_block(block, blockbuf);
-        buf += write_size;
-        size -= write_size;
-        bytes_written += write_size;
-        if (dirent->size < orig_offset + bytes_written)
-            dirent->size = orig_offset + bytes_written;
+                        memset(child_path, 0, sizeof(child_path));
+                    }
+                }
+            }
+        }
+
+        block = NEXT_BLOCK(block);
     }
 
-    flush_dirblock();
-    return bytes_written;
+    return 0;
 }
 
-static int fuse_mfdoom_rename(const char *from, const char *to)
+static int mfdoom_rename(const char *from, const char *to)
 {
     block_t             block;
     block_t             nextblock;
@@ -1037,6 +1069,78 @@ doublebreak:
     flush_dirblock();
 
     return 0;
+}
+
+static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
+  off_t offset, struct fuse_file_info *fi)
+{
+    block_t             block;
+    char                blockbuf[BLOCK_SIZE];
+    size_t              bytes_written;
+    mfdoom_dirent*      dirent;
+    off_t               orig_offset = offset;
+    size_t              write_size;
+    char                name[NAME_LENGTH];
+    char                random_path[BLOCK_SIZE];
+
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    if (dirent->type != TYPE_FILE)
+        return -EACCES;
+
+    // Save file name for later
+    memcpy(name, dirent->name, dirent->namelen);
+
+    // Don't write beyond max file size
+    if (size > BLOCKS_PER_FILE * superblock.s.block_size - offset)
+        size = BLOCKS_PER_FILE * superblock.s.block_size - offset;
+
+    if (offset >= BLOCKS_PER_FILE * superblock.s.block_size)
+        return -EFBIG;                          /* File is too big */
+    else if (size == 0)
+        return -EIO;                            /* Empty writes are illegal */
+
+    assert(superblock.s.block_size == BLOCK_SIZE);
+
+    block = offset_to_block(dirent->file_start, offset);
+    offset = OFFSET_IN_BLOCK(offset);
+
+    for (bytes_written = 0;  size > 0;  block = NEXT_BLOCK(block), offset = 0) {
+        if (offset == 0  &&  size >= superblock.s.block_size)
+            read_block(block, blockbuf);        /* Only read if necessary */
+        write_size = size;
+        if (write_size > superblock.s.block_size - offset)
+            write_size = superblock.s.block_size - offset;
+        memcpy(blockbuf + offset, buf, write_size);
+        write_block(block, blockbuf);
+        buf += write_size;
+        size -= write_size;
+        bytes_written += write_size;
+        if (dirent->size < orig_offset + bytes_written)
+            dirent->size = orig_offset + bytes_written;
+    }
+
+    flush_dirblock();
+
+    /*
+     * If random moves are enabled, try to find a random 
+     * directory to move the file into. If no path is generated, 
+     * write to root. If the original path is generated, just 
+     * randomly generate again. 
+     */
+    if (random_moves) {
+        find_random_dir("/", random_path)
+        strcat(random_path, name);
+        mfdoom_rename(path, random_path);
+    }
+
+    return bytes_written;
+}
+
+static int fuse_mfdoom_rename(const char *from, const char *to)
+{
+    return mfdoom_rename(from, to);
 }
 
 static int fuse_mfdoom_statfs(const char *path, struct statvfs *stbuf)
