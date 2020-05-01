@@ -198,6 +198,9 @@ static void* fuse_mfdoom_init(struct fuse_conn_info *conn)
 {
     size_t              sblock_size, fat_size;
 
+    // Initialize random seed
+    srand(time(0));
+
     /*
      * Read superblock and FAT, if they exist.  We don't use read_block
      * because if we just created the backing file, the read will fail
@@ -963,7 +966,7 @@ static int find_random_dir(const char *path, char *buf)
      * Parent directory selected
      */ 
     if (random <= prob) {
-        strcpy(buf, path, strlen(path));
+        strcpy(buf, path);
         checked_dirs = 0;
         return 1;
     }
@@ -1119,7 +1122,7 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
 
     // Save file name and access count for later
     accesses = dirent->accesses;
-    strcpy(name, dirent->name, dirent->namelen);
+    strcpy(name, dirent->name);
 
     // Don't write beyond max file size
     if (size > BLOCKS_PER_FILE * superblock.s.block_size - offset)
@@ -1163,7 +1166,7 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
          * plus 1 - BASE_PROB times portion of total
          * accesses
          */
-        prob = BASE_PROB
+        prob = BASE_PROB;
 
         // Avoid div-by-zero
         if (superblock.s.access_count != 0)
