@@ -1028,8 +1028,8 @@ static int mfdoom_rename(const char *from, const char *to)
         return -ENOENT;
 
     /*
-     * Store from_dirent in a local dirent buffer
-     */ 
+     * Store from_dirent in appropriate local variables
+     */
     from_file_start = from_dirent->file_start;
     from_size = from_dirent->size;
     from_accesses = from_dirent->accesses;
@@ -1069,6 +1069,7 @@ doublebreak:
     to_dirent->file_start = from_file_start;
     to_dirent->type = from_type;
     to_dirent->size = from_size;
+    to_dirent->accesses = from_accesses;
     cp = strrchr(to, '/');
     if (cp == NULL)
         cp = to;
