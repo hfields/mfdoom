@@ -56,12 +56,12 @@ static union {
 static block_t          fat_table[TABLE_LEN];
 
 /*
- * Directory entries are hacked to be exactly 64 bytes.  NAME_LENGTH
+ * Directory entries are hacked to be exactly 72 bytes.  NAME_LENGTH
  * must incorporate the sizes of all fields in mfdoom_dirent.  Also
  * note that NAME_LENGTH must be 255 or less, so that the namelen
  * field in dirent can be only one byte.
  */
-#define DIRENT_LENGTH   64
+#define DIRENT_LENGTH   72
 #define NAME_LENGTH     (DIRENT_LENGTH - 1 - 1 - 2 * sizeof (size_t))
 
 /*
@@ -83,7 +83,8 @@ typedef struct {
 /*
  * Variables for random file moves
  */
-unsigned char random_moves = 0;     /* Whether random file moves are allowed */
+#define MOVE_DENOM  4               /* Constant for calculating probability of random move */
+unsigned char random_moves = 1;     /* Whether random file moves are allowed */
 size_t checked_dirs = 0;            /* Previously considered dirs in random selection */
 
 
@@ -948,7 +949,7 @@ static int find_random_dir(const char *path, char *buf)
     * to determine if the parent directory should
     * be selected.
     */
-    prob = 1.0 / (superblock.s.dir_count - checked_dirs);
+    prob = 1.0 / (float)(superblock.s.dir_count - checked_dirs);
     random = (float)rand()/(float)(RAND_MAX);
 
     /*
@@ -1009,6 +1010,7 @@ static int mfdoom_rename(const char *from, const char *to)
     mfdoom_dirent*      to_dirent;
     block_t             from_file_start;
     size_t              from_size;
+    size_t              from_accesses;
     unsigned char       from_type;
     size_t              len;
 
@@ -1026,10 +1028,11 @@ static int mfdoom_rename(const char *from, const char *to)
         return -ENOENT;
 
     /*
-     * Store info from from_dirent before dirbuf is overwritten
+     * Store from_dirent in a local dirent buffer
      */ 
     from_file_start = from_dirent->file_start;
     from_size = from_dirent->size;
+    from_accesses = from_dirent->accesses;
     from_type = from_dirent->type;
 
     /*
@@ -1101,6 +1104,9 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
     mfdoom_dirent*      dirent;
     off_t               orig_offset = offset;
     size_t              write_size;
+    size_t              accesses;
+    float               prob;
+    float               random;
     char                name[NAME_LENGTH];
     char                random_path[BLOCK_SIZE];
 
@@ -1110,7 +1116,8 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
     if (dirent->type != TYPE_FILE)
         return -EACCES;
 
-    // Save file name for later
+    // Save file name and access count for later
+    accesses = dirent->accesses;
     memcpy(name, dirent->name, dirent->namelen);
 
     // Don't write beyond max file size
@@ -1145,15 +1152,28 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
     flush_dirblock();
 
     /*
-     * If random moves are enabled, try to find a random 
-     * directory to move the file into. If no path is generated, 
-     * write to root. If the original path is generated, just 
-     * randomly generate again. 
+     * If random moves are enabled, randomly move directory
+     * with probability depending on how often this file has
+     * been accessed compared to other files.
      */
     if (random_moves) {
-        find_random_dir("/", random_path);
-        strcat(random_path, name);
-        mfdoom_rename(path, random_path);
+        /*
+         * Probability of random move is file accesses
+         * divided by total accesses plus MOVE_DENOM
+         */
+        prob = (float)accesses / (float)(superblock.s.access_count + MOVE_DENOM);
+        random = (float)rand()/(float)(RAND_MAX);
+
+        if (random <= prob) {
+            /*
+             * Try to find a random directory to move the file into. 
+             * If no path is generated, write to root. If the original 
+             * path is generated, just randomly generate again. 
+             */
+            find_random_dir("/", random_path);
+            strcat(random_path, name);
+            mfdoom_rename(path, random_path);
+        }
     }
 
     return bytes_written;
@@ -1163,39 +1183,6 @@ static int fuse_mfdoom_rename(const char *from, const char *to)
 {
     return mfdoom_rename(from, to);
 }
-
-static int fuse_mfdoom_statfs(const char *path, struct statvfs *stbuf)
-{
-    block_t                 block;
-    size_t                  free_blocks;
-
-    stbuf->f_bsize = superblock.s.block_size;   /* file system block size */
-    stbuf->f_frsize = superblock.s.block_size;  /* fragment size */
-    stbuf->f_blocks = superblock.s.total_blocks; /* fs size in f_frsize units */
-    stbuf->f_files = 0;                         /* # inodes */
-    stbuf->f_ffree = 0;                         /* # free inodes */
-    stbuf->f_favail = 0;                        /* # free inodes for non-root */
-    stbuf->f_fsid = 0;                          /* file system ID */
-    stbuf->f_flag = 0;                          /* mount flags */
-    stbuf->f_namemax = NAME_LENGTH;             /* max filename length */
-
-    /*
-     * Calculate f_bfree
-     */
-    
-    block = superblock.s.free_list;
-    free_blocks = 0;
-    while (block != 0) {
-        free_blocks++;
-        block = NEXT_BLOCK(block);
-    }
-
-    stbuf->f_bfree = free_blocks;               /* # free blocks */
-    stbuf->f_bavail = stbuf->f_bfree;           /* # free blocks for non-root */
-    return 0;
-}
-
-
 
 static struct fuse_operations fuse_mfdoom_oper = {
         .init           = fuse_mfdoom_init,
@@ -1212,8 +1199,7 @@ static struct fuse_operations fuse_mfdoom_oper = {
         .truncate       = fuse_mfdoom_truncate,
         .open           = fuse_mfdoom_open,
         .read           = fuse_mfdoom_read,
-        .write          = fuse_mfdoom_write,
-        .statfs         = fuse_mfdoom_statfs,
+        .write          = fuse_mfdoom_write
 };
 
 int main(int argc, char *argv[])
