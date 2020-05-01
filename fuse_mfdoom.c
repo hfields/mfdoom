@@ -86,7 +86,7 @@ typedef struct {
 /*
  * Variables for random file moves
  */
-#define MOVE_DENOM  4               /* Constant for calculating probability of random move */
+#define BASE_PROB  0.5              /* Base probability of random move */
 unsigned char random_moves = 1;     /* Whether random file moves are allowed */
 size_t checked_dirs = 0;            /* Previously considered dirs in random selection */
 
@@ -963,7 +963,7 @@ static int find_random_dir(const char *path, char *buf)
      * Parent directory selected
      */ 
     if (random <= prob) {
-        memcpy(buf, path, strlen(path));
+        strcpy(buf, path, strlen(path));
         checked_dirs = 0;
         return 1;
     }
@@ -1119,7 +1119,7 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
 
     // Save file name and access count for later
     accesses = dirent->accesses;
-    memcpy(name, dirent->name, dirent->namelen);
+    strcpy(name, dirent->name, dirent->namelen);
 
     // Don't write beyond max file size
     if (size > BLOCKS_PER_FILE * superblock.s.block_size - offset)
@@ -1159,10 +1159,16 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
      */
     if (random_moves) {
         /*
-         * Probability of random move is file accesses
-         * divided by total accesses plus MOVE_DENOM
+         * Probability of random move is BASE_PROB
+         * plus 1 - BASE_PROB times portion of total
+         * accesses
          */
-        prob = (float)accesses / (float)(superblock.s.access_count + MOVE_DENOM);
+        prob = BASE_PROB
+
+        // Avoid div-by-zero
+        if (superblock.s.access_count != 0)
+            prob += (1.0 - BASE_PROB) * (float)accesses / (float)(superblock.s.access_count);
+        
         random = (float)rand()/(float)(RAND_MAX);
 
         if (random <= prob) {
