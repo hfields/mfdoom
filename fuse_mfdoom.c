@@ -38,6 +38,7 @@ struct sblock {
     size_t              total_blocks;   /* Total blocks (disk size) */
     size_t              block_size;     /* Size of each block */
     size_t              dir_count;      /* Number of directories */
+    size_t              access_count;   /* Total number of file accesses */
     block_t             fat_start;      /* First block of File Allocation Table */
     block_t             files_start;    /* First block of files */
     block_t             free_list;      /* First block of free list */
@@ -69,6 +70,7 @@ static block_t          fat_table[TABLE_LEN];
 typedef struct {
     block_t             file_start;     /* Starting block of the file */
     size_t              size;           /* Size of the file */
+    size_t              accesses;       /* Number of times the file has been accessed */
     unsigned char       type;           /* Entry type (see below) */
     unsigned char       namelen;        /* Length of name */
     char                name[NAME_LENGTH];  /* File name */
@@ -81,7 +83,7 @@ typedef struct {
 /*
  * Variables for random file moves
  */
-unsigned char random_moves = 1;     /* Whether random file moves are allowed */
+unsigned char random_moves = 0;     /* Whether random file moves are allowed */
 size_t checked_dirs = 0;            /* Previously considered dirs in random selection */
 
 
@@ -221,6 +223,7 @@ static void* fuse_mfdoom_init(struct fuse_conn_info *conn)
     superblock.s.total_blocks = DISK_SIZE / BLOCK_SIZE;
     superblock.s.block_size = BLOCK_SIZE;
     superblock.s.dir_count = 1;
+    superblock.s.access_count = 0;
 
     /*
      * The FAT starts just past the superblock
@@ -424,6 +427,7 @@ static int fuse_mfdoom_access(const char *path, int mask)
      */
     if (dirent->type == TYPE_DIR  &&  mask == W_OK)
         return -EACCES;
+
     return 0;
 }
 
@@ -552,6 +556,7 @@ doublebreak:
         return -ENOSPC;                 /* No space for new files */
     dirent->type = TYPE_FILE;
     dirent->size = 0;
+    dirent->accesses = 0;
     cp = strrchr(path, '/');
     if (cp == NULL)
         cp = path;
@@ -673,6 +678,7 @@ static int fuse_mfdoom_unlink(const char *path)
         return -ENOENT;
 
     start_block = going_dirent->file_start;
+    superblock.s.access_count -= going_dirent->accesses;
 
     /*
      * Remove the file by zeroing its directory entry.
@@ -685,9 +691,10 @@ static int fuse_mfdoom_unlink(const char *path)
     free_blocks(start_block);
 
     /*
-     * Write the directory back.
+     * Write the directory and superblock back
      */
     flush_dirblock();
+    flush_superblock();
     return 0;
 }
 
@@ -859,6 +866,17 @@ static int fuse_mfdoom_open(const char *path, struct fuse_file_info *fi)
         return -ENOENT;
     if (dirent->type != TYPE_FILE)
         return -EACCES;
+
+    // Increment accesses (but not for directories)
+    dirent->accesses++;
+    superblock.s.access_count++;
+
+    /*
+     * Write the directory and superblock back
+     */
+    flush_dirblock();
+    flush_superblock();
+
     /*
      * Open succeeds if the file exists.
      */
