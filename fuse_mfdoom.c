@@ -39,6 +39,8 @@ struct sblock {
     size_t              block_size;     /* Size of each block */
     size_t              dir_count;      /* Number of directories */
     size_t              access_count;   /* Total number of file accesses */
+    size_t              rename_count;   /* Total number of (manual) renames */
+    size_t              move_count;     /* Total number of random moves */
     block_t             fat_start;      /* First block of File Allocation Table */
     block_t             files_start;    /* First block of files */
     block_t             free_list;      /* First block of free list */
@@ -74,6 +76,7 @@ typedef struct {
     unsigned char       namelen;        /* Length of name */
     char                name[NAME_LENGTH];  /* File name */
     size_t              accesses;       /* Number of times the file has been accessed */
+    size_t              moves;          /* Number of times the file has been randomly moved */
 }
                         mfdoom_dirent;
 
@@ -225,6 +228,8 @@ static void* fuse_mfdoom_init(struct fuse_conn_info *conn)
     superblock.s.block_size = BLOCK_SIZE;
     superblock.s.dir_count = 1;
     superblock.s.access_count = 0;
+    superblock.s.rename_count = 0;
+    superblock.s.move_count = 0;
 
     /*
      * The FAT starts just past the superblock
@@ -558,6 +563,7 @@ doublebreak:
     dirent->type = TYPE_FILE;
     dirent->size = 0;
     dirent->accesses = 0;
+    dirent->moves = 0;
     cp = strrchr(path, '/');
     if (cp == NULL)
         cp = path;
@@ -680,6 +686,7 @@ static int fuse_mfdoom_unlink(const char *path)
 
     start_block = going_dirent->file_start;
     superblock.s.access_count -= going_dirent->accesses;
+    superblock.s.move_count -= going_dirent->moves;
 
     /*
      * Remove the file by zeroing its directory entry.
@@ -1077,12 +1084,13 @@ doublebreak:
 
     /*
      * Re-find the file being renamed.
-     * Zero it to delete the entry
+     * Zero it to delete the entry.
      */
     from_dirent = find_dirent(from, 0);
     if (from_dirent == NULL)
         return -ENOENT;
     memset(from_dirent, 0, sizeof *from_dirent);
+
     flush_dirblock();
 
     return 0;
@@ -1159,7 +1167,7 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
 
         if (random <= prob) {
             memset(random_path, 0, sizeof(random_path));
-            
+
             /*
              * Try to find a random directory to move the file into. 
              * If no path is generated, write to root. If the original 
@@ -1167,7 +1175,17 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
              */
             find_random_dir("/", random_path);
             strcat(random_path, name);
-            mfdoom_rename(path, random_path);
+            if (mfdoom_rename(path, random_path) == 0) {
+                /*
+                 * Update random move counts
+                 */
+                dirent = find_dirent(random_path, 0);
+                dirent->moves++;
+                superblock.s.move_count++;
+                
+                flush_dirblock();
+                flush_superblock();
+            }
         }
     }
 
@@ -1176,7 +1194,17 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
 
 static int fuse_mfdoom_rename(const char *from, const char *to)
 {
-    return mfdoom_rename(from, to);
+    int res;
+
+    /*
+     * Successful renames increment rename count
+     */
+    if (res = mfdoom_rename(from, to) == 0) {
+        superblock.s.rename_count++;
+        flush_superblock();
+    }
+
+    return res;
 }
 
 static struct fuse_operations fuse_mfdoom_oper = {
