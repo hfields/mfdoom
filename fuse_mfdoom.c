@@ -56,12 +56,12 @@ static union {
 static block_t          fat_table[TABLE_LEN];
 
 /*
- * Directory entries are hacked to be exactly 72 bytes.  NAME_LENGTH
+ * Despite the extra fields, we set DIRENT_LENGTH to 64. NAME_LENGTH
  * must incorporate the sizes of all fields in mfdoom_dirent.  Also
  * note that NAME_LENGTH must be 255 or less, so that the namelen
  * field in dirent can be only one byte.
  */
-#define DIRENT_LENGTH   72
+#define DIRENT_LENGTH   64
 #define NAME_LENGTH     (DIRENT_LENGTH - 1 - 1 - 2 * sizeof (size_t))
 
 /*
@@ -70,10 +70,10 @@ static block_t          fat_table[TABLE_LEN];
 typedef struct {
     block_t             file_start;     /* Starting block of the file */
     size_t              size;           /* Size of the file */
-    size_t              accesses;       /* Number of times the file has been accessed */
     unsigned char       type;           /* Entry type (see below) */
     unsigned char       namelen;        /* Length of name */
     char                name[NAME_LENGTH];  /* File name */
+    size_t              accesses;       /* Number of times the file has been accessed */
 }
                         mfdoom_dirent;
 
@@ -1008,10 +1008,7 @@ static int mfdoom_rename(const char *from, const char *to)
     const char*         cp;
     mfdoom_dirent*      from_dirent;
     mfdoom_dirent*      to_dirent;
-    block_t             from_file_start;
-    size_t              from_size;
-    size_t              from_accesses;
-    unsigned char       from_type;
+    char                dirent_buf[sizeof(mfdoom_dirent)];
     size_t              len;
 
     /*
@@ -1028,12 +1025,9 @@ static int mfdoom_rename(const char *from, const char *to)
         return -ENOENT;
 
     /*
-     * Store from_dirent in appropriate local variables
+     * Store from_dirent in a local buffer
      */
-    from_file_start = from_dirent->file_start;
-    from_size = from_dirent->size;
-    from_accesses = from_dirent->accesses;
-    from_type = from_dirent->type;
+    memcpy(dirent_buf, from_dirent, sizeof(mfdoom_dirent));
 
     /*
      * Check if new path already exists.
@@ -1066,10 +1060,8 @@ static int mfdoom_rename(const char *from, const char *to)
 doublebreak:
     if (block == 0)
         return -EFBIG;                  /* No room in the directory */
-    to_dirent->file_start = from_file_start;
-    to_dirent->type = from_type;
-    to_dirent->size = from_size;
-    to_dirent->accesses = from_accesses;
+
+    memcpy(to_dirent, dirent_buf, sizeof(mfdoom_dirent));
     cp = strrchr(to, '/');
     if (cp == NULL)
         cp = to;
