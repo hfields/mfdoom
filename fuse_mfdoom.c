@@ -1158,6 +1158,8 @@ static int fuse_mfdoom_write(const char *path, const char *buf, size_t size,
         random = (float)rand()/(float)(RAND_MAX);
 
         if (random <= prob) {
+            memset(random_path, 0, sizeof(random_path));
+            
             /*
              * Try to find a random directory to move the file into. 
              * If no path is generated, write to root. If the original 
